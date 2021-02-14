@@ -1,0 +1,10 @@
+_BASE_: "base.yaml"
+MODEL:
+  DQRF_DETR:
+    AUX_LOSS: True
+    NUM_CLASSES: 80
+    NUM_QUERIES: 300
+    DENSE_QUERY: False
+    RECTIFIED_ATTENTION: False
+
+OUTPUT_DIR: ./experiments_coco/baseline_coco
