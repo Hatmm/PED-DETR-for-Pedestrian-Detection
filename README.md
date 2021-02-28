@@ -4,9 +4,7 @@
 
 ![](readme/fig.jpeg)
 
-Code will be released soon, we are cleaning the code and rewriting it on the Detectron2 framework. Current code only support running 
-deformable DETR on COCO.
-
+Code for PED: DETR For (Crowd) Pedestrian Detection
 
 ## Paper
 [PED: DETR for Crowd Pedestrian Detection](https://arxiv.org/abs/2012.06785)
@@ -15,7 +13,7 @@ deformable DETR on COCO.
 
 
 ## Installation
-The codebases are built on top of [Detectron2](https://github.com/facebookresearch/detectron2), [DETR](https://github.com/facebookresearch/detr) and [Deformable DETR](https://github.com/fundamentalvision/Deformable-DETR)
+The codebases are built on top of [Detectron2](https://github.com/facebookresearch/detectron2), [DETR](https://github.com/facebookresearch/detr), [Deformable DETR](https://github.com/fundamentalvision/Deformable-DETR) and [Fast-Transformer](https://github.com/idiap/fast-transformers)
 
 
 ## License

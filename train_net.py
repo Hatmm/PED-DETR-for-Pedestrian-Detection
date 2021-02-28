@@ -31,10 +31,12 @@ from detectron2.evaluation import (
 from detectron2.solver.build import maybe_add_gradient_clipping
 from detectron2.utils.events import get_event_storage, JSONWriter, TensorboardXWriter
 
-from dqrf import add_dqrf_config
-from dqrf.utils.dataset_mapper import DqrfDatasetMapper
-from dqrf.utils.validation_set import ValidationLoss, build_detection_val_loader
-from dqrf.utils.metric_writer import TrainingMetricPrinter
+from dqrf import add_dqrf_config, add_dataset_path
+from dqrf.utils.get_crowdhuman_dicts import get_crowdhuman_dicts
+from dqrf.utils.dataset_mapper import DqrfDatasetMapper, CH_DqrfDatasetMapper
+from dqrf.utils.ch_evalutor import CrowdHumanEvaluator
+from dqrf.utils.validation_set import ValidationLoss, ValidationLoss_2, build_detection_val_loader
+from dqrf.utils.metric_writer import TrainingMetricPrinter, PeriodicWriter_withInitLoss
 try:
     _nullcontext = contextlib.nullcontext  # python 3.7+
 except AttributeError:
@@ -57,6 +59,13 @@ class Trainer(DefaultTrainer):
                 self.clip_norm_val = cfg.SOLVER.CLIP_GRADIENTS.CLIP_VALUE
         super().__init__(cfg)
 
+        # overwrite model to use new pytorch feature for balanced gradient
+        # model = self.build_model(cfg)
+        # if comm.get_world_size() > 1:
+        #     model = DistributedDataParallel(
+        #         model, device_ids=[comm.get_local_rank()], broadcast_buffers=False,
+        #       gradient_as_bucket_view=True
+        #     )
 
     def build_hooks(self):
         """
@@ -65,6 +74,7 @@ class Trainer(DefaultTrainer):
         :return: list[HookBase]
         """
         if comm.get_world_size() > 1:
+            # logger.info(f'Distributed training active on {[comm.get_local_rank()]}')
             self.weight_dict = self.model.module.criterion.weight_dict
         else:
             self.weight_dict = self.model.criterion.weight_dict
@@ -72,7 +82,7 @@ class Trainer(DefaultTrainer):
         hooks = super().build_hooks()
 
 
-        hooks.insert(-2, ValidationLoss(
+        hooks.insert(-2, ValidationLoss_2(
             self.cfg,
             self._trainer.model,
             build_detection_val_loader(
@@ -80,7 +90,18 @@ class Trainer(DefaultTrainer):
                 self.cfg.DATASETS.TEST[0],
                 self.cfg.SOLVER.IMS_PER_BATCH,
                 mapper=self._return_val_mapper()),
-            self.weight_dict))
+            self.weight_dict))  # insert before writer and eval hook
+
+        # if comm.is_main_process():
+            # Here the default print/log frequency of each writer is used.
+            # run writers in the end, so that evaluation metrics are written
+            # hooks.pop()
+            # we keep an average of the last 20 values e.g EMA with Beta ~0.95 since 20 = 1 / (1 - beta)
+            # hooks.append(PeriodicWriter_withInitLoss(self.build_writers(), period=20))
+        # hooks.insert(-2, ValidationLoss(
+        #     self.cfg,
+        #     self.model,
+        # self.weight_dict)) #insert before writer and eval hook
 
         return hooks
 
@@ -94,7 +115,8 @@ class Trainer(DefaultTrainer):
     def _return_val_mapper(self):
         if 'coco' in self.cfg.DATASETS.TRAIN[0]:
             mapper = DqrfDatasetMapper(self.cfg, True)
-
+        elif 'crowd' in self.cfg.DATASETS.TRAIN[0]:
+            mapper = CH_DqrfDatasetMapper(self.cfg, True)
         else:
             mapper = None
         return mapper
@@ -126,6 +148,7 @@ class Trainer(DefaultTrainer):
             storage.put_scalar("data_time", data_time)
 
             # average the rest metrics
+            # Note these are unscaled
             metrics_dict = {
                 k: np.mean([x[k] for x in all_metrics_dict]) for k in all_metrics_dict[0].keys()
             }
@@ -148,7 +171,8 @@ class Trainer(DefaultTrainer):
         """
         If you want to do something with the data, you can wrap the dataloader.
         """
-        data = next(self._trainer._data_loader_iter)
+        data = next(self._trainer._data_loader_iter) # work around for last detectron2 version
+        # data = next(self._data_loader_iter)
         data_time = time.perf_counter() - start
 
         """
@@ -160,6 +184,7 @@ class Trainer(DefaultTrainer):
         self._trainer.optimizer.zero_grad()
         losses.backward()
 
+        # self._trainer._write_metrics(loss_dict, data_time)
         self._write_metrics(loss_dict, data_time)
         """
         If you need gradient clipping/scaling or other processing, you can
@@ -182,13 +207,15 @@ class Trainer(DefaultTrainer):
             output_folder = os.path.join(cfg.OUTPUT_DIR, "inference")
         if 'coco' in cfg.DATASETS.TEST[0]:
             return COCOEvaluator(dataset_name, cfg, True, output_folder)
-
+        elif 'crowd' in cfg.DATASETS.TEST[0]:
+            return CrowdHumanEvaluator(dataset_name, cfg, True, output_folder)
 
     @classmethod
     def build_test_loader(cls, cfg, dataset_name):
         if 'coco' in cfg.DATASETS.TRAIN[0]:
             mapper = DqrfDatasetMapper(cfg, False)
-
+        elif 'crowd' in cfg.DATASETS.TRAIN[0]:
+            mapper = CH_DqrfDatasetMapper(cfg, False)
         else:
             mapper = None
         return build_detection_test_loader(cfg, dataset_name, mapper=mapper)
@@ -197,7 +224,8 @@ class Trainer(DefaultTrainer):
     def build_train_loader(cls, cfg):
         if 'coco' in cfg.DATASETS.TRAIN[0]:
             mapper = DqrfDatasetMapper(cfg, True)
-
+        elif 'crowd' in cfg.DATASETS.TRAIN[0]:
+            mapper = CH_DqrfDatasetMapper(cfg, True)
         else:
             mapper = None
         return build_detection_train_loader(cfg, mapper=mapper)
@@ -215,6 +243,7 @@ class Trainer(DefaultTrainer):
                     break
             return out
 
+        #careful DEFORMABLE DETR yields poorer performance is its FAKE FPN is trained on the same LR as Resnet
         #Resnet parameters name is backbone.0
         lr_backbone_names = ['backbone.0']
 
@@ -223,13 +252,13 @@ class Trainer(DefaultTrainer):
                 "params": [p for n, p in model.named_parameters() if
                            not is_backbone(n, lr_backbone_names) and
                            not (
-                                       "sampling_locs" in n or "sampling_cens" in n or "sampling_weight" in n) and p.requires_grad],
+                                       "roi_fc1" in n or "roi_fc2" in n or "offset" in n or "sampling_locs" in n or "sampling_cens" in n or "sampling_weight" in n or "conv_offset" in n or 'learnable_fc' in n) and p.requires_grad],
                 "lr": cfg.SOLVER.BASE_LR,
             },
             {
                 "params": [p for n, p in model.named_parameters() if is_backbone(n, lr_backbone_names) and
                            not (
-                                       "sampling_locs" in n or "sampling_cens" in n or "sampling_weight" in n) and p.requires_grad],
+                                       "roi_fc1" in n or "roi_fc2" in n or "offset" in n or "sampling_locs" in n or "sampling_cens" in n or "sampling_weight" in n or "conv_offset" in n or 'learnable_fc' in n) and p.requires_grad],
                 "lr": cfg.SOLVER.BASE_LR * cfg.SOLVER.BACKBONE_MULTIPLIER,
             },
             {
@@ -252,8 +281,7 @@ class Trainer(DefaultTrainer):
         optimizer = torch.optim.AdamW(param_dicts, lr=cfg.SOLVER.BASE_LR,
                                       weight_decay=cfg.SOLVER.WEIGHT_DECAY)
         return optimizer
-
-
+    
 def setup(args):
     """
     Create configs and perform basic setups.
@@ -262,7 +290,16 @@ def setup(args):
     add_dqrf_config(cfg)
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
-
+    if "crowd" in cfg.DATASETS.TRAIN[0]:
+        add_dataset_path(cfg)
+        ch_train = get_crowdhuman_dicts(cfg.CH_PATH.ANNOT_PATH_TRAIN, cfg.CH_PATH.IMG_PATH_TRAIN)
+        ch_val = get_crowdhuman_dicts(cfg.CH_PATH.ANNOT_PATH_VAL, cfg.CH_PATH.IMG_PATH_VAL)
+        DatasetCatalog.register(cfg.DATASETS.TRAIN[0], ch_train)
+        MetadataCatalog.get(cfg.DATASETS.TRAIN[0]).set(thing_classes=["Background", "Pedestrian"])
+        DatasetCatalog.register(cfg.DATASETS.TEST[0], ch_val)
+        MetadataCatalog.get(cfg.DATASETS.TEST[0]).set(thing_classes=["Background", "Pedestrian"])
+        MetadataCatalog.get(cfg.DATASETS.TEST[0]).set(json_file=cfg.CH_PATH.ANNOT_PATH_VAL)
+        MetadataCatalog.get(cfg.DATASETS.TEST[0]).set(gt_dir=cfg.CH_PATH.IMG_PATH_VAL)
     cfg.freeze()
     default_setup(cfg, args)
     return cfg
@@ -274,7 +311,7 @@ def main(args):
         model = Trainer.build_model(cfg)
         DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(cfg.MODEL.WEIGHTS, resume=args.resume)
         res = Trainer.test(cfg, model)
-
+       
         return res
 
     trainer = Trainer(cfg)
@@ -285,7 +322,7 @@ def main(args):
 if __name__ == "__main__":
 
     args = default_argument_parser().parse_args()
-
+    
     print("Command Line Args:", args)
     """
     A torch process group which only includes processes that on the same machine as the current process.
