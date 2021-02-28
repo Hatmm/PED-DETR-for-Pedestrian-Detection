@@ -20,8 +20,9 @@ from dqrf.backbone import build_deformable_detr_backbone
 from dqrf.transformer import build_transformer
 from dqrf.utils.utils import MLP, _get_clones, NestedTensor
 from dqrf.utils.box_ops import box_xyxy_to_cxcywh, box_cxcywh_to_xyxy
+from dqrf.ch_criterion import SetCriterion as ch_criterion
 from dqrf.criterion import SetCriterion as coco_criterion
-from dqrf.matcher import build_vanilla_matcher
+from dqrf.matcher import build_matcher, build_vanilla_matcher
 
 __all__ = ["DQRF_DETR"]
 
@@ -38,7 +39,10 @@ class DQRF_DETR(nn.Module):
             is_coco_type_data = True
             matcher = build_vanilla_matcher(cfg)
             self.criterion = coco_criterion(cfg, matcher=matcher)
-
+        else:
+            is_coco_type_data = False
+            matcher = build_matcher(cfg)
+            self.criterion = ch_criterion(cfg, matcher=matcher)
         self.is_coco_type_data = is_coco_type_data
         self.aux_loss = cfg.MODEL.DQRF_DETR.AUX_LOSS
         num_queries = cfg.MODEL.DQRF_DETR.NUM_QUERIES
@@ -49,7 +53,7 @@ class DQRF_DETR(nn.Module):
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
 
-        zero_tgt = True
+        zero_tgt = False
         self.query_embed = nn.Embedding(num_queries, hidden_dim if zero_tgt else hidden_dim * 2)
         self.input_proj = nn.Conv2d(self.backbone.num_channels, hidden_dim, kernel_size=1)
 
@@ -67,6 +71,8 @@ class DQRF_DETR(nn.Module):
         pixel_mean = torch.Tensor(cfg.MODEL.PIXEL_MEAN).to(self.device).view(3, 1, 1)
         pixel_std = torch.Tensor(cfg.MODEL.PIXEL_STD).to(self.device).view(3, 1, 1)
         self.normalizer = lambda x: (x - pixel_mean) / pixel_std
+        # self.register_buffer("pixel_mean", torch.tensor(cfg.MODEL.PIXEL_MEAN).view(3, 1, 1))
+        # self.register_buffer("pixel_std", torch.tensor(cfg.MODEL.PIXEL_STD).view(3, 1, 1))
         self.to(self.device)
 
     def forward(self, batched_inputs):
@@ -100,10 +106,10 @@ class DQRF_DETR(nn.Module):
         outputs_class = torch.stack(outputs_classes)
         outputs_coord = torch.stack(outputs_coords)
 
-        output = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1], 'dec_attns': dec_attns, 'pos_center': pos_center[-1]}
+        output = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1], 'dec_attns': dec_attns, 'pos_center': pos_center[-1], 'queries': hs[-1]}
         if self.training:
             if self.aux_loss:
-                output['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord, pos_center)
+                output['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord, pos_center, hs)
             if self.is_coco_type_data:
                 gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
                 targets = self.prepare_targets(gt_instances)
@@ -116,15 +122,17 @@ class DQRF_DETR(nn.Module):
         else:
             box_cls = output["pred_logits"]
             box_pred = output["pred_boxes"]
-            results = self.inference(box_cls, box_pred, images.image_sizes)
-
-            processed_results = []
-            for results_per_image, input_per_image, image_size in zip(results, batched_inputs, images.image_sizes):
-                height = input_per_image.get("height", image_size[0]) # if "heigh does not exist take img size"
-                width = input_per_image.get("width", image_size[1])
-                r = detector_postprocess(results_per_image, height, width)
-                processed_results.append({"instances": r})
-            return processed_results
+            orig_image_sizes = torch.stack([torch.as_tensor([b.get("height"), b.get("width")]) for b in batched_inputs], dim=0).to(self.device)
+            results = self.inference(box_cls, box_pred, orig_image_sizes)
+            return results
+            # processed_results = []
+            # for results_per_image, input_per_image, image_size in zip(results, batched_inputs, images.image_sizes):
+            #     height = input_per_image.get("height", image_size[0]) # if "heigh does not exist take img size"
+            #     width = input_per_image.get("width", image_size[1])
+            #     r = self.post_processor(results_per_image, height, width)
+            #     r = detector_postprocess(results_per_image, height, width) # this will clip predictions
+                # processed_results.append({"instances": r})
+            # return processed_results
 
     def inference(self, box_cls, box_pred, image_sizes):
         inference_dict = {
@@ -132,6 +140,12 @@ class DQRF_DETR(nn.Module):
             0: self.inference_ch,
         }
         return inference_dict[self.is_coco_type_data](box_cls, box_pred, image_sizes)
+    # def post_processor(self, results_per_image, height, width):
+    #     post_processor_dict = {
+    #         1: detector_postprocess,
+    #         0: ch_detector_postprocess
+    #     }
+    #     return post_processor_dict[self.is_coco_type_data](results_per_image, height, width)
     def inference_coco(self, box_cls, box_pred, image_sizes):
         """
         Arguments:
@@ -159,11 +173,13 @@ class DQRF_DETR(nn.Module):
 
         for i, (scores_per_image, labels_per_image, box_pred_per_image, image_size) in enumerate(zip(scores, labels, box_pred, image_sizes)):
             result = Instances(image_size)
+            # result.pred_boxes = box_pred_per_image
             result.pred_boxes = Boxes(box_pred_per_image)
             result.pred_boxes.scale(scale_x=image_size[1], scale_y=image_size[0])
             result.scores = scores_per_image
             result.pred_classes = labels_per_image
-            results.append(result)
+            results.append({"instances": result})
+            # results.append(result)
         return results
 
     def inference_ch(self, box_cls, box_pred, image_sizes):
@@ -181,18 +197,24 @@ class DQRF_DETR(nn.Module):
         assert len(box_cls) == len(image_sizes)
         results = []
 
+        # For each box we assign the best class or the second best if the best on is `no_object`.
         prob = box_cls.sigmoid()
         scores = prob#.squeeze(-1) # [bs, num_query, 1]
         labels = torch.ones_like(scores, dtype=torch.int64, device=scores.device)#.squeeze(-1) # [bs, num_query, 1]
         box_pred = box_cxcywh_to_xyxy(box_pred)
+        img_h, img_w = image_sizes.unbind(1)
+        scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
+        box_pred = box_pred * scale_fct[:, None, :]
 
         for i, (scores_per_image, labels_per_image, box_pred_per_image, image_size) in enumerate(zip(scores, labels, box_pred, image_sizes)):
             result = Instances(image_size)
-            result.pred_boxes = Boxes(box_pred_per_image)
-            result.pred_boxes.scale(scale_x=image_size[1], scale_y=image_size[0])
+            result.pred_boxes = box_pred_per_image
+            # result.pred_boxes = Boxes(box_pred_per_image)
+            # result.pred_boxes.scale(scale_x=image_size[1], scale_y=image_size[0])
             result.scores = scores_per_image
             result.pred_classes = labels_per_image
-            results.append(result)
+            results.append({"instances": result})
+            # results.append(result)
         return results
 
     def prepare_targets(self, targets):
@@ -220,7 +242,9 @@ class DQRF_DETR(nn.Module):
         This works by padding the images to the same size,
         and storing in a field the original sizes of each image
         """
+        # images = [x["image"].to(self.device) for x in batched_inputs]
         images = [self.normalizer(x["image"].to(self.device)) for x in batched_inputs]
+        # images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images)
 
         return images
@@ -236,10 +260,62 @@ class DQRF_DETR(nn.Module):
         return NestedTensor(tensor, mask)
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord, pos_center):
+    def _set_aux_loss(self, outputs_class, outputs_coord, pos_center, queries):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
 
-        return [{'pred_logits': a, 'pred_boxes': b, 'pos_center': c} for a, b, c in
-                zip(outputs_class[:-1], outputs_coord[:-1], pos_center[:-1])]
+        return [{'pred_logits': a, 'pred_boxes': b, 'pos_center': c, 'queries': d} for a, b, c, d in
+                zip(outputs_class[:-1], outputs_coord[:-1], pos_center[:-1], queries[:-1])]
+
+def ch_detector_postprocess(results: Instances, output_height: int, output_width: int):
+    """ Same as detectron2's detector_postprocess except that we don't clip boxes outside range
+    Resize the output instances.
+    The input images are often resized when entering an object detector.
+    As a result, we often need the outputs of the detector in a different
+    resolution from its inputs.
+
+    This function will resize the raw outputs of an R-CNN detector
+    to produce outputs according to the desired output resolution.
+
+    Args:
+        results (Instances): the raw outputs from the detector.
+            `results.image_size` contains the input image resolution the detector sees.
+            This object might be modified in-place.
+        output_height, output_width: the desired output resolution.
+
+    Returns:
+        Instances: the resized output from the model, based on the output resolution
+    """
+    # Change to 'if is_tracing' after PT1.7
+    if isinstance(output_height, torch.Tensor):
+        # Converts integer tensors to float temporaries to ensure true
+        # division is performed when computing scale_x and scale_y.
+        output_width_tmp = output_width.float()
+        output_height_tmp = output_height.float()
+        new_size = torch.stack([output_height, output_width])
+    else:
+        new_size = (output_height, output_width)
+        output_width_tmp = output_width
+        output_height_tmp = output_height
+
+    scale_x, scale_y = (
+        output_width_tmp / results.image_size[1],
+        output_height_tmp / results.image_size[0],
+    )
+    results = Instances(new_size, **results.get_fields())
+
+    if results.has("pred_boxes"):
+        output_boxes = results.pred_boxes
+    elif results.has("proposal_boxes"):
+        output_boxes = results.proposal_boxes
+    else:
+        output_boxes = None
+    assert output_boxes is not None, "Predictions must contain boxes!"
+
+    output_boxes.scale(scale_x, scale_y)
+    # output_boxes.clip(results.image_size) removing box clipping
+
+    results = results[output_boxes.nonempty()]
+
+    return results

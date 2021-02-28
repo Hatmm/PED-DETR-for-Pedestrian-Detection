@@ -7,7 +7,7 @@
 # ------------------------------------------------------------------------
 from typing import Optional
 from dqrf.ops.functions.local_attn import MultiHeadAttention
-from dqrf.ops.functions.ms_deform_attn import SamplingAttention_RA, SamplingEncAttention
+from dqrf.ops.functions.ms_deform_attn import SamplingAttention_RA, SamplingEncAttention, SamplingAttention_dec
 import torch
 from torch import nn, Tensor
 from torch.nn.init import xavier_uniform_, constant_, normal_
@@ -35,7 +35,7 @@ class Transformer(nn.Module):
         dec_sampling_points = cfg.MODEL.DQRF_DETR.DEC_SAMPLING_POINTS
         dense_query = cfg.MODEL.DQRF_DETR.DENSE_QUERY
         rectified_attention = cfg.MODEL.DQRF_DETR.RECTIFIED_ATTENTION
-        self.zero_tgt = True
+        self.zero_tgt = False
 
         checkpoint_enc_ffn = True
         checkpoint_dec_ffn = True
@@ -71,6 +71,9 @@ class Transformer(nn.Module):
         constant_(self.sampling_cens.bias.data[2:3], -2.0)
         constant_(self.sampling_cens.bias.data[3:4], -1.5)
 
+        # constant_(self.sampling_cens.bias.data[2:], -2.0)
+
+
         self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, d_model))
         normal_(self.level_embed)
 
@@ -80,7 +83,7 @@ class Transformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
         for m in self.modules():
-            if isinstance(m, (SamplingAttention_RA, SamplingEncAttention)):
+            if isinstance(m, (SamplingAttention_RA, SamplingEncAttention, SamplingAttention_dec)):
                 m._reset_parameters()
 
 
@@ -130,11 +133,18 @@ class Transformer(nn.Module):
                               spatial_shape=spatial_shapes)
 
         bs, c = memory.shape[:2]
-        tgt = query_embed.unsqueeze(1).expand(-1, bs, -1)
+        # L, E
+        if not self.zero_tgt:
+            query_embed, tgt = torch.split(query_embed, c, dim=1)
+            query_embed = query_embed.unsqueeze(1).expand(-1, bs, -1)
+            tgt = tgt.unsqueeze(1).expand(-1, bs, -1)
+        else:
+            tgt = torch.zeros_like(query_embed)
+            query_embed = query_embed.unsqueeze(1).expand(-1, bs, -1)
         pos_centers = self.sampling_cens(tgt)
         # [#dec, #query, bs, dim] or [#query, bs, dim]
         hs, inter_ps, dec_attns = self.decoder(tgt, memory, memory_key_padding_mask=mask_flatten,
-                                               pos=lvl_pos_embed_flatten, #query_embed=query_embed,
+                                               pos=lvl_pos_embed_flatten, query_pos=query_embed,
                                                pos_centers=pos_centers, spatial_shape=spatial_shapes,
                                                )
         if self.return_intermediate_dec:
@@ -250,7 +260,7 @@ class TransformerEncoderLayer(nn.Module):
                  num_feature_levels=4):
         super().__init__()
 
-        self.self_attn = SamplingEncAttention(d_model, dec_sampling_points=enc_sampling_points, feature_levels=num_feature_levels)
+        self.self_attn = SamplingEncAttention(d_model, dec_sampling_heads=nhead, dec_sampling_points=enc_sampling_points, feature_levels=num_feature_levels)
 
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
@@ -298,10 +308,14 @@ class TransformerDecoderLayer(nn.Module):
                  rectified_attention=False
                  ):
         super().__init__()
-        self.self_attn = MultiHeadAttention(d_model, nhead, dropout)
-
-        self.multihead_attn = SamplingAttention_RA(d_model, dec_sampling_points=dec_sampling_points,
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        # self.self_attn = MultiHeadAttention(d_model, nhead, dropout)
+        if rectified_attention:
+            self.multihead_attn = SamplingAttention_RA(d_model, dec_sampling_points=dec_sampling_points,
                                                     num_feature_levels=num_feature_levels)
+        else:
+            self.multihead_attn = SamplingAttention_dec(d_model, dec_sampling_points=dec_sampling_points,
+                                                   num_feature_levels=num_feature_levels)
 
 
 
@@ -332,8 +346,8 @@ class TransformerDecoderLayer(nn.Module):
                 pos_centers=None, spatial_shape=None):
 
         q = k = self.with_pos_embed(tgt, query_pos)
-        # tgt2 = self.self_attn(q, k, tgt, attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask)[0]
-        tgt2 = self.self_attn(q, k, tgt, attn_mask=tgt_mask, mask=tgt_key_padding_mask)[0]
+        tgt2 = self.self_attn(q, k, tgt, attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask)[0]
+        # tgt2 = self.self_attn(q, k, tgt, attn_mask=tgt_mask, mask=tgt_key_padding_mask)[0]
 
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)

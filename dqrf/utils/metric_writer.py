@@ -4,10 +4,13 @@
 #
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 from detectron2.utils.events import EventWriter, get_event_storage
+from detectron2.engine.hooks import HookBase
 import datetime
 import time
 import torch
 import logging
+
+
 
 class TrainingMetricPrinter(EventWriter):
     """
@@ -81,3 +84,83 @@ class TrainingMetricPrinter(EventWriter):
                 memory="max_mem: {:.0f}M".format(max_mem_mb) if max_mem_mb is not None else "",
             )
         )
+
+
+class InitMetricPrinter(EventWriter):
+    """
+    Similar to CommongMetricPrinter but only prints training loss
+    """
+    logger = logging.getLogger("detectron2.utils.events")
+    def __init__(self):
+        super(InitMetricPrinter, self).__init__()
+
+    @classmethod
+    def write(cls):
+        storage = get_event_storage()
+        iteration = storage.iter
+
+        try:
+            lr = "{:.6f}".format(storage.history("lr").latest())
+        except KeyError:
+            lr = "N/A"
+
+        if torch.cuda.is_available():
+            max_mem_mb = torch.cuda.max_memory_allocated() / 1024.0 / 1024.0
+        else:
+            max_mem_mb = None
+
+        # NOTE: max_mem is parsed by grep in "dev/parse_results.sh"
+        cls.logger.info(
+            "iter: Initialization values  {losses}  lr: {lr}  {memory}".format(
+                iter=iteration,
+                losses="  ".join(
+                    [
+                        "{}: {:.3f}".format(k.split('train_loss_')[-1], v.latest())
+                        for k, v in storage.histories().items()
+                        if ("train" in k and "AP" not in k)
+                    ]
+                ),
+                lr=lr,
+                memory="max_mem: {:.0f}M".format(max_mem_mb) if max_mem_mb is not None else "",
+            )
+        )
+
+
+class PeriodicWriter_withInitLoss(HookBase):
+    """
+    same as PeriodicWriter but print initial loss which is useful for debugging loss
+    Write events to EventStorage (by calling ``writer.write()``) periodically.
+
+    It is executed every ``period`` iterations and after the last iteration.
+    Note that ``period`` does not affect how data is smoothed by each writer.
+    """
+
+    def __init__(self, writers, period=20):
+        """
+        Args:
+            writers (list[EventWriter]): a list of EventWriter objects
+            period (int):
+        """
+        self._writers = writers
+        for w in writers:
+            assert isinstance(w, EventWriter), w
+        self._period = period
+
+    def after_step(self):
+        if (self.trainer.iter + 1) % self._period == 0 or (
+            self.trainer.iter == self.trainer.max_iter - 1
+        ):
+            for writer in self._writers:
+                writer.write()
+        elif (self.trainer.iter +1) == 1:
+            InitMetricPrinter.write()
+            # for writer in self._writers:
+            #     if isinstance(writer, InitMetricPrinter):
+            #         writer.write()
+
+    def after_train(self):
+        for writer in self._writers:
+            # If any new data is found (e.g. produced by other after_train),
+            # write them before closing
+            writer.write()
+            writer.close()

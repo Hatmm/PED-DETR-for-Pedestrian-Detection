@@ -24,7 +24,81 @@ from detectron2.data.dataset_mapper import DatasetMapper
 import detectron2.utils.comm as comm
 
 
-class ValidationLoss(HookBase): # faster than ValidationLoss
+class ValidationLoss(HookBase):
+    def __init__(self, cfg, model, weight_dict):
+        super().__init__()
+        self._cfg = cfg.clone()
+        self._model = model
+        self._period = cfg.TEST.EVAL_PERIOD
+        self.weight_dict = weight_dict
+        self.logger = "detectron2.engine.hooks" #logging.getLogger("detectron2.engine.hooks")
+    def _do_eval_loss(self, data_loader):
+        total = len(data_loader)
+        with torch.no_grad():
+            for idx, inputs in enumerate(data_loader):
+                loss_dict = self._model(inputs)
+                # loss_dict_scaled = {k: v * self.weight_dict[k] if k in self.weight_dict else v for k, v in loss_dict.items()}
+                device = next(iter(loss_dict.values())).device
+                with torch.cuda.stream(torch.cuda.Stream() if device.type == "cuda" else None):
+                    metrics_dict = {'val_' +k: v.detach().cpu().item() for k, v in loss_dict.items()}
+                    all_metrics_dict = comm.gather(metrics_dict)
+
+                if comm.is_main_process():
+                    metrics_dict = {
+                         k: np.mean([x[k] for x in all_metrics_dict]) for k in all_metrics_dict[0].keys()
+                    }
+                    total_losses_reduced = sum(metrics_dict[k] * self.weight_dict[k.split('val_')[-1]] for k in metrics_dict.keys() if k.split('val_')[-1] in self.weight_dict)
+                    if not np.isfinite(total_losses_reduced):
+                        raise FloatingPointError(
+                            f"Loss became infinite or NaN at iteration={idx}!\n"
+                            f"loss_dict = {metrics_dict}"
+                        )
+                    if torch.cuda.is_available():
+                        max_mem_mb = torch.cuda.max_memory_allocated() / 1024.0 / 1024.0
+                    else:
+                        max_mem_mb = None
+                    log_every_n_seconds(logging.INFO,
+                                        msg=" iter: {iter}/{total}  val_loss:{val_loss}   {losses}  {memory}".format(
+                                            iter=idx + 1,
+                                            total=total,
+                                            val_loss='{:.3f}'.format(total_losses_reduced),
+                                            losses="  ".join(
+                                                [
+                                                    "{}: {:.3f}".format(k.split('val_loss_')[-1], v)
+                                                    for k, v in metrics_dict.items()
+
+                                                ]
+                                            ),
+                                            memory="max_mem: {:.0f}M".format(
+                                                max_mem_mb) if max_mem_mb is not None else ""
+
+                                        ),
+                                        n=5,
+                                        name=self.logger
+                                        )
+
+                    storage = get_event_storage()
+                    if len(metrics_dict) > 1:
+                        storage.put_scalars(total_val_loss=total_losses_reduced,
+                                        **metrics_dict)
+        # comm.synchronize()
+    def after_step(self):
+        next_iter = self.trainer.iter + 1
+        is_final = next_iter == self.trainer.max_iter
+        if is_final or (self._period > 0 and next_iter % self._period == 0):
+            if 'coco' in self._cfg.DATASETS.TRAIN[0]:
+                mapper = DqrfDatasetMapper(self._cfg, True)
+            elif 'crowd' in self._cfg.DATASETS.TRAIN[0]:
+                mapper = CH_DqrfDatasetMapper(self._cfg, True)
+            else:
+                mapper = None
+            # data_loader = build_detection_train_loader(self._cfg, mapper=mapper)
+            data_loader = build_detection_test_loader(self._cfg, self._cfg.DATASETS.TEST[0], mapper=mapper)
+            self._do_eval_loss(data_loader)
+
+
+
+class ValidationLoss_2(HookBase): # faster than ValidationLoss
     def __init__(self, cfg, model, data_loader, weight_dict):
         super().__init__()
         self._cfg = cfg.clone()
@@ -84,7 +158,28 @@ class ValidationLoss(HookBase): # faster than ValidationLoss
                                         n=5,
                                         name=self._logger_name
                                         )
+                    # log_every_n_seconds(logging.INFO,
+                    #                     msg=" iter: {iter}/{total}  val_loss:{total_loss}   {losses}  {memory}".format(
+                    #                         iter=idx + 1,
+                    #                         total=total,
+                    #                         total_loss='{:.3f}'.format(total_losses_reduced),
+                    #                         losses="  ".join(
+                    #                             [
+                    #                                 "{}: {:.3f}".format(k.split('val_loss_')[-1], v)
+                    #                                 for k, v in metrics_dict.items()
+                    #
+                    #                             ]
+                    #                         ),
+                    #                         memory="max_mem: {:.0f}M".format(
+                    #                             max_mem_mb) if max_mem_mb is not None else ""
+                    #
+                    #                     ),
+                    #                     n=5,
+                    #                     name=self._logger_name
+                    #                     )
 
+
+        # comm.synchronize()
     def after_step(self):
         next_iter = self.trainer.iter + 1
         is_final = next_iter == self.trainer.max_iter
@@ -137,7 +232,10 @@ def build_detection_val_loader(cfg, dataset_name, total_batch_size,  mapper=None
     # sampler = InferenceSampler(len(dataset))
     sampler = DistributedSampler(dataset, shuffle=False)
 
+    # logger.info("Start Computing Validation Loss on {} images".format(len(dataset)))
+    # drop_last so the batch always have the same size
     batch_sampler = torch.utils.data.sampler.BatchSampler(sampler, batch_size, drop_last=False)
+    # batch_sampler = torch.utils.data.sampler.BatchSampler(sampler, 1, drop_last=False)
 
     data_loader = torch.utils.data.DataLoader(
         dataset,

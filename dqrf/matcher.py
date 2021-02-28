@@ -10,7 +10,170 @@ from scipy.optimize import linear_sum_assignment
 from torch import nn
 from dqrf.utils.box_ops import box_cxcywh_to_xyxy, box_iof, generalized_box_iou_, generalized_box_iou
 
+class IgnoreMatcher_vbox(nn.Module):
 
+    def __init__(self, cost_class=1, cost_bbox=1, cost_giou=1, ignore_iou_thresh=1.1):
+        """Creates the matcher
+
+        Params:
+            cost_class: This is the indicesrelative weight of the classification error in the matching cost
+            cost_bbox: This is the relative weight of the L1 error of the bounding box coordinates in the matching cost
+            cost_giou: This is the relative weight of the giou loss of the bounding box in the matching cost
+        """
+        super().__init__()
+        self.cost_class = cost_class
+        self.cost_bbox = cost_bbox
+        self.cost_giou = cost_giou
+        self.ignore_iou_thresh = ignore_iou_thresh
+        self.NEGATIVE_TARGET = -1
+        self.IGNORE_TARGET = -2
+        assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0, "all costs cant be 0"
+
+    @torch.no_grad()
+    def forward(self, outputs, targets):
+        """ Performs the matching
+        Params:
+                 "preds_prob": Tensor of dim [num_queries, num_classes] with the classification logits
+                 "preds_boxes": Tensor of dim [num_queries, 4] with the predicted box coordinates
+                 "gt_bboxes": Tensor of dim [num_target_boxes, 5] [x1, y1, x2, y2, label]
+        Returns:
+            target_gt
+            overlaps
+        """
+        result = []
+
+        for preds_prob, preds_boxes, t in zip(outputs['pred_logits'], outputs['pred_boxes'], targets):
+            preds_prob = preds_prob.sigmoid()
+            gt_bboxes = torch.cat((t['vboxes'], t['labels'].unsqueeze(-1).float()),dim=-1)
+            ig_bboxes = t['iboxes']
+
+            K = preds_prob.shape[0]
+
+            target_gt = gt_bboxes.new_full((K,), self.NEGATIVE_TARGET, dtype=torch.int64)
+            target_gt_iou = gt_bboxes.new_full((K,), 0)
+            pos_mask = gt_bboxes.new_zeros((K,), dtype=torch.bool)
+
+            if gt_bboxes.numel() > 0:
+                tgt_ids = gt_bboxes[:, 4].long()
+                tgt_bbox = gt_bboxes[:, :4]
+
+
+                alpha = 0.25
+                gamma = 2.0
+                neg_cost_class = (1 - alpha) * (preds_prob ** gamma) * (-(1 - preds_prob + 1e-8).log())
+                pos_cost_class = alpha * ((1 - preds_prob) ** gamma) * (-(preds_prob + 1e-8).log())
+                cost_class = pos_cost_class - neg_cost_class
+
+
+                cost_bbox = torch.cdist(preds_boxes, tgt_bbox, p=1)
+
+                cost_giou, overlaps = generalized_box_iou_(box_cxcywh_to_xyxy(preds_boxes), box_cxcywh_to_xyxy(tgt_bbox))
+                cost_giou = -cost_giou
+
+                C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+                C = C.cpu()
+
+                src_idx, tgt_idx = linear_sum_assignment(C)
+
+
+                src_idx = torch.from_numpy(src_idx).to(device=gt_bboxes.device, dtype=torch.int64)
+                tgt_idx = torch.from_numpy(tgt_idx).to(device=gt_bboxes.device, dtype=torch.int64)
+                target_gt[src_idx] = tgt_idx
+                target_gt_iou[src_idx] = overlaps[src_idx, tgt_idx]
+                pos_mask[src_idx] = True
+
+            if ig_bboxes.numel() > 0:
+                ign_bbox = ig_bboxes[:, :4]
+
+                overlaps = box_iof(box_cxcywh_to_xyxy(preds_boxes), box_cxcywh_to_xyxy(ign_bbox))
+                dt_to_ig_max, _ = overlaps.max(dim=1)
+                ignored_dt_mask = dt_to_ig_max >= self.ignore_iou_thresh
+                ignored_dt_mask = (ignored_dt_mask ^ (ignored_dt_mask & pos_mask))
+                target_gt[ignored_dt_mask] = self.IGNORE_TARGET
+            result.append(target_gt)
+        return result
+
+class IgnoreMatcher(nn.Module):
+
+    def __init__(self, cost_class=1, cost_bbox=1, cost_giou=1, ignore_iou_thresh=1.1, vbox=False, fast=False):
+        """Creates the matcher
+
+        Params:
+            cost_class: This is the indicesrelative weight of the classification error in the matching cost
+            cost_bbox: This is the relative weight of the L1 error of the bounding box coordinates in the matching cost
+            cost_giou: This is the relative weight of the giou loss of the bounding box in the matching cost
+        """
+        super().__init__()
+        self.cost_class = cost_class
+        self.cost_bbox = cost_bbox
+        self.cost_giou = cost_giou
+        self.ignore_iou_thresh = ignore_iou_thresh
+        self.vbox = vbox
+        self.NEGATIVE_TARGET = -1
+        self.IGNORE_TARGET = -2
+        assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0, "all costs cant be 0"
+
+    @torch.no_grad()
+    def forward(self, outputs, targets):
+        """ Performs the matching
+        Params:
+                 "preds_prob": Tensor of dim [num_queries, num_classes] with the classification logits
+                 "preds_boxes": Tensor of dim [num_queries, 4] with the predicted box coordinates
+                 "gt_bboxes": Tensor of dim [num_target_boxes, 5] [x1, y1, x2, y2, label]
+        Returns:
+            list of tensor of dim [num_queries] with idx of corresponding GT, -1 for background, -2 for ignore
+        """
+        result = []
+
+        for preds_prob, preds_boxes, t in zip(outputs['pred_logits'], outputs['pred_boxes'], targets):
+            preds_prob = preds_prob.sigmoid()
+            gt_bboxes = torch.cat((t['boxes'], t['labels'].unsqueeze(-1).float()),dim=-1)
+            ig_bboxes = t['iboxes']
+
+            K = preds_prob.shape[0]
+
+            target_gt = gt_bboxes.new_full((K,), self.NEGATIVE_TARGET, dtype=torch.int64)
+            target_gt_iou = gt_bboxes.new_full((K,), 0)
+            pos_mask = gt_bboxes.new_zeros((K,), dtype=torch.bool)
+
+            if gt_bboxes.numel() > 0:
+                tgt_ids = gt_bboxes[:, 4].long()
+                tgt_bbox = gt_bboxes[:, :4]
+
+
+                alpha = 0.25
+                gamma = 2.0
+                neg_cost_class = (1 - alpha) * (preds_prob ** gamma) * (-(1 - preds_prob + 1e-8).log())
+                pos_cost_class = alpha * ((1 - preds_prob) ** gamma) * (-(preds_prob + 1e-8).log())
+                cost_class = pos_cost_class - neg_cost_class
+
+
+                cost_bbox = torch.cdist(preds_boxes, tgt_bbox, p=1)
+
+                cost_giou, overlaps = generalized_box_iou_(box_cxcywh_to_xyxy(preds_boxes), box_cxcywh_to_xyxy(tgt_bbox))
+                cost_giou = -cost_giou
+
+                C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+                C = C.cpu()
+
+                src_idx, tgt_idx = linear_sum_assignment(C)
+
+                src_idx = torch.from_numpy(src_idx).to(device=gt_bboxes.device, dtype=torch.int64)
+                tgt_idx = torch.from_numpy(tgt_idx).to(device=gt_bboxes.device, dtype=torch.int64)
+                target_gt[src_idx] = tgt_idx
+                target_gt_iou[src_idx] = overlaps[src_idx, tgt_idx]
+                pos_mask[src_idx] = True
+
+            if ig_bboxes.numel() > 0:
+                ign_bbox = ig_bboxes[:, :4]
+                overlaps = box_iof(box_cxcywh_to_xyxy(preds_boxes), box_cxcywh_to_xyxy(ign_bbox))
+                dt_to_ig_max, _ = overlaps.max(dim=1)
+                ignored_dt_mask = dt_to_ig_max >= self.ignore_iou_thresh
+                ignored_dt_mask = (ignored_dt_mask ^ (ignored_dt_mask & pos_mask))
+                target_gt[ignored_dt_mask] = self.IGNORE_TARGET
+
+            result.append(target_gt)
+        return result
 
 class HungarianMatcher(nn.Module):
     """This class computes an assignment between the targets and the predictions of the network
@@ -93,6 +256,15 @@ class HungarianMatcher(nn.Module):
 
         return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
 
+def build_matcher(cfg):
+    matcher = {
+        'vbox': IgnoreMatcher_vbox(cost_class=cfg.MODEL.DQRF_DETR.COST_CLASS, cost_bbox=cfg.MODEL.DQRF_DETR.COST_BBOX,
+                              cost_giou=cfg.MODEL.DQRF_DETR.COST_GIOU,  ignore_iou_thresh=cfg.MODEL.DQRF_DETR.IGNORE_IOU_THRESHOLD),
+        'fbox': IgnoreMatcher(cost_class=cfg.MODEL.DQRF_DETR.COST_CLASS, cost_bbox=cfg.MODEL.DQRF_DETR.COST_BBOX,
+                              cost_giou=cfg.MODEL.DQRF_DETR.COST_GIOU, ignore_iou_thresh=cfg.MODEL.DQRF_DETR.IGNORE_IOU_THRESHOLD)
+    }
+
+    return matcher
 
 def build_vanilla_matcher(cfg):
     return HungarianMatcher(cost_class=cfg.MODEL.DQRF_DETR.COST_CLASS, cost_bbox=cfg.MODEL.DQRF_DETR.COST_BBOX,

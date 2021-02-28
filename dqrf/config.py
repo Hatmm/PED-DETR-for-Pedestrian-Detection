@@ -8,7 +8,31 @@
 
 from detectron2.config import CfgNode as CN
 
+def add_dataset_path(cfg):
+    """
+    Add config for dataset path
+    """
 
+    _C = cfg
+
+    _C.CH_PATH = CN()
+
+    # _C.CH_PATH.ANNOT_PATH_TRAIN = "/data/share/crowdhuman/CrowdHuman_train.json"
+    # _C.CH_PATH.IMG_PATH_TRAIN = "/data/share/crowdhuman/train2017"
+    # _C.CH_PATH.ANNOT_PATH_VAL = "/data/share/crowdhuman/CrowdHuman_val.json"
+    # _C.CH_PATH.IMG_PATH_VAL = "/data/share/crowdhuman/val2017"
+
+
+    _C.CH_PATH.ANNOT_PATH_TRAIN = "/Users/hatmlin/Dataset/crowd/CrowdHuman_train.json"
+    _C.CH_PATH.IMG_PATH_TRAIN = "/Users/hatmlin/Dataset/crowd/train2017"
+    _C.CH_PATH.ANNOT_PATH_VAL = "/Users/hatmlin/Dataset/crowd/CrowdHuman_val.json"
+    _C.CH_PATH.IMG_PATH_VAL = "/Users/hatmlin/Dataset/crowd/val2017"
+    #
+    #
+    # _C.CH_PATH.ANNOT_PATH_TRAIN =  "/mnt/cache/share_data/lcm/CrowdHuman/CrowdHuman_train.json"
+    # _C.CH_PATH.IMG_PATH_TRAIN =  "/mnt/cache/share_data/lcm/CrowdHuman/train2017"
+    # _C.CH_PATH.ANNOT_PATH_VAL = "/mnt/cache/share_data/lcm/CrowdHuman/CrowdHuman_val.json"
+    # _C.CH_PATH.IMG_PATH_VAL = "/mnt/cache/share_data/lcm/CrowdHuman/val2017"
 
 def add_dqrf_config(cfg):
     """
